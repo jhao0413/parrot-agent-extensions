@@ -146,25 +146,44 @@ async function translateProse($, text) {
  * 翻一个消息块，逐段穿插：每段原文下面直接跟它自己的 `> ` 译文；
  * ``` 代码块不送翻也不插入译文。返回拼好的完整 markdown，
  * 全部跳过（中文/无散文）时返回 null。
+ * 段落并行翻（并发 4）：本地 llama.cpp 有连续 batching，串行会让长回复等几十秒。
  */
 async function translateBlock($, text) {
-  const out = []
-  let any = false
+  const paras = [] // { index, out: [原文, 译文?] }
+  let i = 0
   for (const part of text.split(/(```[\s\S]*?```)/g)) {
     if (!part.trim()) continue
     if (part.startsWith('```')) {
-      out.push(part)
+      paras.push({ code: part })
       continue
     }
-    // 散文部分按空行分段，逐段翻译后紧跟在原段下面（列表内部是单换行，会被当成一段整体翻，保留结构）
+    // 散文部分按空行分段（列表内部是单换行，会被当成一段整体翻，保留结构）
     for (const para of part.split(/\n{2,}/)) {
-      if (!para.trim()) continue
-      out.push(para)
-      const zh = await translateProse($, para)
-      if (zh) {
-        out.push(zh.split('\n').map((l) => `> ${l}`).join('\n'))
-        any = true
-      }
+      if (para.trim()) paras.push({ text: para })
+    }
+  }
+
+  const POOL = 4
+  let cursor = 0
+  const worker = async () => {
+    while (cursor < paras.length) {
+      const p = paras[cursor++]
+      if (p.code !== undefined) continue
+      try {
+        const zh = await translateProse($, p.text)
+        if (zh) p.zh = zh
+      } catch { /* 单段失败不影响其它段 */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(POOL, paras.length) }, worker))
+
+  const out = []
+  let any = false
+  for (const p of paras) {
+    out.push(p.code !== undefined ? p.code : p.text)
+    if (p.zh) {
+      out.push(p.zh.split('\n').map((l) => `> ${l}`).join('\n'))
+      any = true
     }
   }
   return any ? out.join('\n\n') : null
@@ -186,11 +205,15 @@ function scheduleOne($, text) {
     .then((md) => {
       cache.set(text, { state: md ? 'done' : 'skip', md })
       diag($, `done len=${text.length} ${md ? 'md=' + md.length : 'skip'}`)
-      if (show) $.ui.invalidate('ui.render')
+      if (show) {
+        $.ui.invalidate('ui.render')
+        $.ui.toast('译文就绪')
+      }
     })
     .catch((err) => {
       cache.set(text, { state: 'error' })
       diag($, `error len=${text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
+      if (show) $.ui.toast('翻译失败，见 /tmp/pt-live.log')
     })
 }
 
@@ -223,7 +246,16 @@ export function register(on, options) {
   on('command.run', { command: 'translate' }, async ($) => {
     show = !show
     diag($, `toggle show=${show}`)
-    $.ui.toast(show ? '译文：显示' : '译文：隐藏')
+    if (show) {
+      // 等待反馈：还有段在翻时直接告诉用户，免得对着空白狂按
+      const pending = [...cache.values()].filter((e) => e.state === 'pending').length
+      const error = [...cache.values()].filter((e) => e.state === 'error').length
+      if (pending) $.ui.toast(`翻译中（还有 ${pending} 块，本地模型较慢）…`)
+      else if (error) $.ui.toast('部分翻译失败，详见 /tmp/pt-live.log')
+      else $.ui.toast('译文：显示')
+    } else {
+      $.ui.toast('译文：隐藏')
+    }
     $.ui.invalidate('ui.render')
     return {}
   })
@@ -239,7 +271,11 @@ export function register(on, options) {
       entry = cache.get(text)
     }
 
-    if (!show || !entry || entry.state !== 'done') return next(e)
+    if (!show) return next(e)
+
+    // 诊断：show=true 时记录每次渲染到达，用于排查「切了显示但没重画」
+    diag($, `render len=${text.length} state=${entry ? entry.state : 'none'}`)
+    if (!entry || entry.state !== 'done') return next(e)
 
     // 缓存里已是拼好的逐段穿插版本，直接替换显示文本（只影响渲染，不落盘不进上下文）
     return next({ ...e, props: { ...e.props, text: entry.md } })
