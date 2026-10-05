@@ -1,8 +1,17 @@
 {
   "name": "parrot-agents",
-  "owner": { "name": "jhao" },
+  "owner": {
+    "name": "jhao"
+  },
   "plugins": [
-    { "name": "parrot-grammar", "source": "./claude/parrot-grammar" },
-    { "name": "parrot-translate", "source": "./claude/parrot-translate" }
-  ]
+    {
+      "name": "parrot-grammar",
+      "source": "./claude/parrot-grammar"
+    },
+    {
+      "name": "parrot-translate",
+      "source": "./claude/parrot-translate"
+    }
+  ],
+  "description": "给编码 agent 的中文母语者语言辅助：prompt 语法检查（parrot-grammar）、回复翻译（parrot-translate）"
 }
