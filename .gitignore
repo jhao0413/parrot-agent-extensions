@@ -1,0 +1,6 @@
+node_modules/
+.DS_Store
+
+# Claude Code 自动生成的 mods API 类型与 tsconfig（加载时重新生成）
+claude/*/.claude-plugin/types/
+claude/*/tsconfig.json

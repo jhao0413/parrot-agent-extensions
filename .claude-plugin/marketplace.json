@@ -1,0 +1,8 @@
+{
+  "name": "parrot-agents",
+  "owner": { "name": "jhao" },
+  "plugins": [
+    { "name": "parrot-grammar", "source": "./claude/parrot-grammar" },
+    { "name": "parrot-translate", "source": "./claude/parrot-translate" }
+  ]
+}

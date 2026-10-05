@@ -1,0 +1,38 @@
+{
+  "name": "parrot-translate",
+  "version": "0.2.0",
+  "description": "Translate Claude's English replies to Chinese in the background; a hotkey toggles showing them",
+  "author": { "name": "jhao" },
+  "userConfig": {
+    "show_by_default": {
+      "type": "boolean",
+      "title": "默认显示译文",
+      "description": "开启后译文直接随回复显示，Ctrl+Y 变为收起/展开",
+      "default": false
+    },
+    "provider": {
+      "type": "string",
+      "title": "翻译服务",
+      "description": "microsoft = Edge 免费接口（默认）；model = 本会话模型；openai = OpenAI 兼容接口（本地 llama.cpp 等）",
+      "options": ["microsoft", "model", "openai"],
+      "default": "microsoft"
+    },
+    "model": {
+      "type": "string",
+      "title": "翻译用模型",
+      "description": "provider = model / openai 时使用；别名（haiku / sonnet）或完整 id",
+      "default": "haiku"
+    },
+    "base_url": {
+      "type": "string",
+      "title": "OpenAI 兼容 Base URL",
+      "description": "provider = openai 时使用，如 http://127.0.0.1:8021/v1",
+      "default": "http://127.0.0.1:8021/v1"
+    },
+    "api_key": {
+      "type": "string",
+      "title": "API Key",
+      "description": "provider = openai 时使用；本地 llama.cpp 随便填（如 sk-local）"
+    }
+  }
+}

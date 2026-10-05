@@ -1,0 +1,4 @@
+{
+  "description": "parrot-grammar hooks module",
+  "modules": ["./register.js"]
+}
