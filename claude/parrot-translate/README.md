@@ -8,12 +8,12 @@ Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换显示�
 
 ## 配置
 
-`/config` 面板可以直接改，或者改 `~/.claude/settings.json`：
+`/config` 面板可以直接改，或者改 `~/.claude/settings.json`（键名与安装方式对应，marketplace 装的就是 `@parrot-agent-extensions`）：
 
 ```json
 {
   "pluginConfigs": {
-    "parrot-translate@inline": {
+    "parrot-translate@parrot-agent-extensions": {
       "options": {
         "show_by_default": true,
         "outbound": true,
@@ -26,7 +26,7 @@ Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换显示�
 }
 ```
 
-值要包在 `"options"` 里，直接写在 `"parrot-translate@inline"` 下面不生效。
+值要包在 `"options"` 里，直接写在插件名下面不生效。
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
@@ -48,7 +48,7 @@ provider 三选一：
 
 ```json
 "pluginConfigs": {
-  "parrot-translate@inline": {
+  "parrot-translate@parrot-agent-extensions": {
     "options": {
       "provider": "openai",
       "model": "index-translate-2b",
@@ -95,5 +95,5 @@ provider 三选一：
 ## 卸载
 
 - marketplace 装的：`claude plugin uninstall parrot-translate@parrot-agent-extensions`
-- 路径加载的：从 `~/.claude/settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS` 删掉本目录路径
-- 从 `~/.claude/keybindings.json` 删掉 `ctrl+y` 一行；删掉 `pluginConfigs` 里的 `parrot-translate@inline`（如有）
+- 从 `~/.claude/settings.json` 的 `pluginConfigs` 删掉 `parrot-translate@parrot-agent-extensions`（如有）；`claude plugin marketplace remove parrot-agent-extensions` 移除源
+- 从 `~/.claude/keybindings.json` 删掉 `ctrl+y` 一行；删掉 `pluginConfigs` 里的 `parrot-translate@parrot-agent-extensions`（如有）
