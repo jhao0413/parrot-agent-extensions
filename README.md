@@ -5,7 +5,6 @@
 ## 组成
 
 - [claude/parrot-translate](./claude/parrot-translate)：Claude Code 插件。提交时将 prompt 改写为地道英文，用户消息行双语对照；回复在后台译成 `lang` 配置的语言，`Ctrl+Y` 切换显示
-- [claude/parrot-grammar](./claude/parrot-grammar)：已退役，功能并入 parrot-translate 的出站链路，代码保留作参考
 - [pi/](./pi)：计划中的 pi 实现，详见其 README
 
 安装、配置与实现细节见各插件的 README。
