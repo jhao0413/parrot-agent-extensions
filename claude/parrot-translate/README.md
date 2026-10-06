@@ -1,17 +1,23 @@
 # parrot-translate (Claude Code)
 
-Claude 的英文回复**后台自动翻成中文**，快捷键（`Ctrl+Y`）切换显示。逐段穿插：每段原文下面直接跟它自己的 `▎` 译文。
+写给想用英文跟模型对话的非英语用户。
 
-## 配置（三项）
+Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换显示，译文跟在对应的原文段落后面。你输入的提示词在发出前会被改写成英文：是外文就翻译，已经是英文就只修语法，意思不变。发出后保留原文和英文的对照。
 
-会话里 **`/config` 面板**可以直接改（每个 userConfig 是一行）；或改 `~/.claude/settings.json`：
+译文和对照都只在显示层，整个对话上下文里始终只有英文。
+
+## 配置
+
+`/config` 面板可以直接改，或者改 `~/.claude/settings.json`：
 
 ```json
 {
   "pluginConfigs": {
     "parrot-translate@inline": {
       "options": {
-        "show_by_default": false,
+        "show_by_default": true,
+        "outbound": true,
+        "lang": "zh-Hans",
         "provider": "microsoft",
         "model": "haiku"
       }
@@ -20,17 +26,25 @@ Claude 的英文回复**后台自动翻成中文**，快捷键（`Ctrl+Y`）切�
 }
 ```
 
-> 注意值要包在 `"options"` 里——直接写 `"parrot-translate@inline": {"provider": ...}` **不会生效**（踩过）。
+值要包在 `"options"` 里，直接写在 `"parrot-translate@inline"` 下面不生效。
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `show_by_default` | `false` | `true` 时译文直接随回复显示，`Ctrl+Y` 变为收起/展开 |
-| `provider` | `microsoft` | `microsoft` = Edge 免费接口（同 parrot 扩展，免 key、快）；`model` = 本会话模型；`openai` = OpenAI 兼容接口（本地 llama.cpp / 远端兼容服务） |
-| `model` | `haiku` | `provider = model / openai` 时用；别名（`haiku` / `sonnet`）或完整 id（如 `index-translate-2b`） |
-| `base_url` | `http://127.0.0.1:8021/v1` | `provider = openai` 时的接口地址 |
-| `api_key` | 空 | `provider = openai` 时用；本地 llama.cpp 随便填（如 `sk-local`，不校验） |
+| `show_by_default` | `true` | 译文随回复直接显示；关掉则 `Ctrl+Y` 展开 |
+| `outbound` | `true` | 出站链路总开关 |
+| `lang` | `zh-Hans` | 你的语言，微软语言码：`zh-Hant`、`ja`、`ko`、`fr`、`de`、`es`、`ru` 等 |
+| `provider` | `microsoft` | 翻译服务，见下 |
+| `model` | `haiku` | `session` / `openai` 用的模型；填别名 haiku / sonnet 或完整 id |
+| `base_url` | `http://127.0.0.1:8021/v1` | `openai` 的接口地址 |
+| `api_key` | 空 | `openai` 用；本地 llama.cpp 随便填，不校验 |
 
-当前生效配置（本地 index-translate-2b）：
+provider 三选一：
+
+- `microsoft`：Edge 免费接口，同 parrot 扩展那套，免 key、快。只会翻译，英文输入没有语法检查，会原样放行
+- `session`：`$.model.complete` 走本会话凭证，免配置，质量更好，耗 token。旧值 `model` 仍被接受
+- `openai`：OpenAI 兼容端点，本地 llama.cpp 或远端服务
+
+以使用本地 index-translate-2b 模型为例：
 
 ```json
 "pluginConfigs": {
@@ -45,48 +59,39 @@ Claude 的英文回复**后台自动翻成中文**，快捷键（`Ctrl+Y`）切�
 }
 ```
 
-实测对比（同一段 5000 字符的回复）：微软 ~3s；模型（haiku）~32s、译文更自然；本地 index-translate-2b ~46s、免费且代码路径保留得很干净。
+同一段 5000 字符的回复：微软 ~3s；haiku ~32s、译文更自然；index-translate-2b ~46s、免费，代码块保留得干净。
+
+## 出站
+
+`prompt.submit` 在提示词进会话之前改写它：外文翻成英文，英文只修语法、拼写、排版，没有问题就原样放行。代码围栏、标识符、文件路径、命令、URL 不碰，散文段并发 4 路。改写完成 turn 才开始，`session` / `openai` 下内容较长会先 toast 提示；任何一步失败都不拦提示词，原文照发。
+
+只拦本机敲 Enter 的提交（`origin.kind === 'composer'`）；斜杠命令、插件、peer、通知的提交不碰。原来做手动检查的 parrot-grammar 已退役，被这条链路取代。
+
+屏幕上的对照是「原文在上、实际发出的英文引用在下」，`Ctrl+Y` 管不到它，那个键只管回复侧。`session` / `openai` 的改写提示词会带上 `lang` 作为作者语言背景，帮模型译得更地道；出站目标始终是英文，不随 `lang` 变。
 
 ## 行为细节
 
-- **翻译默认一直开着**（后台做），快捷键只控制显示；译文按消息块缓存，翻一次后切换即时
-- **防抖 1.5s**：流式渲染期间计时器不断重置，文本稳定（回复结束）约 1.5 秒后才真正去翻。不依赖 `turn.start`/`turn.complete`——实测这对事件不一定触发，一旦不触发整条管线就死掉（第一版就是这个 bug）
-- **逐段穿插**：按空行分段，列表/标题整段翻保留结构；``` 代码块不送翻也不插译文
-- 微软路径靠接口的 `detectedLanguage` 跳过中文块；模型路径先本地判断「中文为主」再跳过，省 token
-- 长段自动按空行切块（≤3000 字符）
-- `/tmp/pt-live.log` 诊断日志（最近 60 条关键转移），排查看它
-- `/translate` 命令与 `Ctrl+Y` 等价；键位在 `~/.claude/keybindings.json`
+- 翻译默认一直在后台做，快捷键只管显示；译文按消息块缓存，翻一次后切换即时
+- 防抖 1.5s：流式渲染期间计时器不断重置，回复稳定约 1.5 秒后才真正去翻。没有依赖 `turn.start` / `turn.complete`，实测这对事件不一定触发，一旦不触发整条管线就死掉
+- 按空行分段，列表、标题整段翻；代码块不送翻也不插译文；长段按空行切块，单块 ≤3000 字符
+- 已是目标语言的块跳过：微软靠接口的 `detectedLanguage` 和 `lang` 比对；`session` / `openai` 对 `zh` 系目标先本地数 CJK 字符，省一次调用；其他语言靠提示词约定「已是目标语言则原样返回」再逐块比对
+- 诊断日志在 `/tmp/pt-live.log`，保留最近 60 条，排查看它
+- `/translate` 命令等价 `Ctrl+Y`，键位在 `~/.claude/keybindings.json`
 
-## 不影响上下文（已验证）
+## 不影响上下文
 
-译文只改**渲染层**：`ui.render` 的 `AssistantMessage` 站点改的是"这块怎么画"。存储和发给模型走另一条路（`session.append` 才能改落盘内容，本插件没用它），所以：
-
-- transcript `.jsonl` 里搜不到译文（实测：屏幕出现过的译文句子 0 次，原文英文能搜到）
-- 下一轮发给模型的内容不含译文，不占上下文 token
-- 模型翻译走的 `$.model.complete` 是独立无历史补全，同样不进会话
+译文只改渲染层：`ui.render` 的 `AssistantMessage` 站点改的是「这块怎么画」，存储和发给模型走另一条路，`session.append` 才能改落盘，本插件没用它。实测：transcript `.jsonl` 里搜不到屏幕上出现过的译文句子，原文能搜到；下一轮请求不含译文，不占 token；`$.model.complete` 是无历史的独立补全，也不进会话。出站改写发生在进会话之前，落盘的是英文，原文同样只活在渲染层，重开会话后对照就没有了。
 
 ## 实现备注
 
-- hooks module 只能 import 相对路径和 `"claude-code"`，无外部依赖（有道版的 md5/openssl 已随有道一起删除）
-- 微软路径的 `parseBody` 兼容宿主把 JSON 响应预解析成对象塞进 `text` 的情况（类型声明说是 string，别信）
-- **本地地址必须走 curl**：宿主的 `$.http.fetch` 连 `127.0.0.1` 会被 reset（SSRF 防护），`openai` provider 改用 `$.process.run` + curl 直连
-- OpenAI 兼容输出会剥 `<think>...</think>`（推理模型空标签）
-- 配置由 `register(on, options)` 的第二参传入，`plugin.json` 的 `userConfig` 声明
-
-## 实测记录（expect 驱动真实 TUI）
-
-- 微软 + 默认隐藏：`Ctrl+Y` 展开后 11~28 行 `▎` 译文 ✓
-- `provider=model`（haiku）+ `show_by_default=true`：不按键直接显示 11 行，译文质量明显更好 ✓
-- `provider=openai`（本地 llama.cpp / index-translate-2b）：逐段翻译 ~46s，代码路径保留干净，无 `<think>` 残留 ✓
-- 防抖调度：渲染 → 1.5s → schedule → done → 显示 ✓
-- 中文回复块正确跳过 ✓；`claude plugin validate` 通过 ✓
-
-## 历史：有道版为什么删了
-
-第一版带过有道网页接口（免 key），为绕沙箱限制走了 curl + openssl 子进程；后按需求移除。实现要点留在 git 历史里：宿主 `$.http.fetch` 发出的请求会被有道回空载荷、AES key 必须对 `TextEncoder` 编码后的字节取 md5（直接传字符串会按 UTF-16 码元 spread，算出来是错的）。
+- hooks module 只能 import 相对路径和 `"claude-code"`，无外部依赖
+- 微软路径的 `parseBody` 兼容宿主把 JSON 预解析成对象塞进 `text` 的情况
+- 本地地址必须走 curl：`$.http.fetch` 连 `127.0.0.1` 会被 reset（SSRF 防护），`openai` 改用 `$.process.run` + curl 直连
+- OpenAI 兼容输出会剥 `<think>...</think>`
+- 配置由 `register(on, options)` 第二参传入，`plugin.json` 的 `userConfig` 声明
 
 ## 卸载
 
-- 从 `~/.claude/settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS` 删掉本目录路径
-- 从 `~/.claude/keybindings.json` 删掉 `ctrl+y` 一行
-- 删掉 `pluginConfigs` 里的 `parrot-translate@inline`（如有）
+- marketplace 装的：`claude plugin uninstall parrot-translate@parrot-agent-extensions`
+- 路径加载的：从 `~/.claude/settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS` 删掉本目录路径
+- 从 `~/.claude/keybindings.json` 删掉 `ctrl+y` 一行；删掉 `pluginConfigs` 里的 `parrot-translate@inline`（如有）

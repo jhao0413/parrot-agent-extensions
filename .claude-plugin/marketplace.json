@@ -1,17 +1,13 @@
 {
-  "name": "parrot-agents",
+  "name": "parrot-agent-extensions",
   "owner": {
     "name": "jhao"
   },
   "plugins": [
     {
-      "name": "parrot-grammar",
-      "source": "./claude/parrot-grammar"
-    },
-    {
       "name": "parrot-translate",
       "source": "./claude/parrot-translate"
     }
   ],
-  "description": "给编码 agent 的中文母语者语言辅助：prompt 语法检查（parrot-grammar）、回复翻译（parrot-translate）"
+  "description": "给编码 agent 的语言辅助扩展：parrot-translate 保证出站 prompt 是地道英文、回复按需译回配置语言"
 }

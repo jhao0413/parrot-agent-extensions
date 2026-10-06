@@ -1,12 +1,14 @@
 /**
- * parrot-translate — Claude 的英文回复自动翻成中文。
+ * parrot-translate — Claude 的英文回复自动翻成配置的目标语言；发出的提示词保证是地道英文。
  *
  * 行为：回复稳定约 1.5s 后后台翻好缓存；快捷键（Ctrl+Y）切换显示。
  * 逐段穿插：每段原文下面直接跟它自己的 `> ` 译文。
+ * 出站：prompt.submit 时把提示词改写成英文（其他语言忠实翻译；英文只修语法，
+ * 不改意思），模型与 transcript 收到的都是英文；用户消息行渲染成双语对照。
  *
  * 翻译服务（/config 里换，见 plugin.json 的 userConfig）：
  *  - microsoft（默认）：Edge 免费接口（与 parrot 扩展同款），无需 key
- *  - model：$.model.complete 走本会话模型凭证（默认 haiku），质量更好、耗 token
+ *  - session：$.model.complete 走本会话凭证跑一次独立补全（默认 haiku），免配置、质量更好、耗 token
  *
  * 注：hooks module 只能 import 相对路径和 "claude-code"，所以没有外部依赖。
  */
@@ -14,13 +16,16 @@ const MAX_CHARS = 3000 // 单次请求的字符上限（微软同款留余量）
 const MODEL_TIMEOUT = 30_000
 
 /** userConfig 传入的配置（register 时初始化） */
-const cfg = { showByDefault: false, provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
+const cfg = { showByDefault: false, outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
 
 /** 显示开关（快捷键翻转；初始值来自 showByDefault 配置） */
 let show = false
 
 /** 原文 -> { state: 'pending'|'done'|'skip'|'error', md? }，按消息块缓存 */
 const cache = new Map()
+
+/** 发出的英文 -> 用户原话：UserMessage 渲染层做双语对照（不落盘、不进上下文） */
+const outboundMap = new Map()
 
 /**
  * 防抖调度：流式期间每次渲染都会重置 1.5s 计时器，文本稳定（流结束）后才真正去翻。
@@ -29,6 +34,21 @@ const cache = new Map()
 let stableTimer = null
 const seen = new Set() // 待调度的原文（一次稳定后批量调度）
 
+/* ---------------- 目标语言（用户语言，/config 可换） ---------------- */
+
+/** 常见微软语言码 -> 英文名（提示词用）；不在表里就直接用码本身 */
+const LANG_NAMES = {
+  'zh-Hans': 'Simplified Chinese', 'zh-Hant': 'Traditional Chinese',
+  en: 'English', ja: 'Japanese', ko: 'Korean', fr: 'French', de: 'German',
+  es: 'Spanish', it: 'Italian', pt: 'Portuguese', ru: 'Russian', ar: 'Arabic',
+  hi: 'Hindi', th: 'Thai', vi: 'Vietnamese', id: 'Indonesian', tr: 'Turkish',
+  nl: 'Dutch', pl: 'Polish', uk: 'Ukrainian',
+}
+const langName = () => LANG_NAMES[cfg.lang] ?? cfg.lang
+/** 同一语言（比主子标签：zh-Hans 与 zh-Hant 都算 zh） */
+const sameLang = (a, b) =>
+  !!a && !!b && String(a).toLowerCase().split('-')[0] === String(b).toLowerCase().split('-')[0]
+
 /* ---------------- 微软（Edge 免费接口，同 parrot microsoft.ts） ---------------- */
 
 /* 宿主有时会把 JSON 响应预解析成对象塞进 text（类型声明说是 string，别信）；两头都兼容 */
@@ -36,8 +56,8 @@ function parseBody(res) {
   return typeof res.text === 'string' ? JSON.parse(res.text) : res.text
 }
 
-async function msFetch($, text) {
-  const qs = new URLSearchParams({ from: '', to: 'zh-Hans', isEnterpriseClient: 'false' })
+async function msFetch($, text, to = cfg.lang) {
+  const qs = new URLSearchParams({ from: '', to, isEnterpriseClient: 'false' })
   const res = await $.http.fetch(`https://edge.microsoft.com/translate/translatetext?${qs}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -46,33 +66,35 @@ async function msFetch($, text) {
   if (!res.ok) throw new Error(`microsoft HTTP ${res.status}`)
   const body = parseBody(res)
   if (!Array.isArray(body) || body.length !== 1) throw new Error('microsoft bad response')
-  return { zh: body[0].translations?.[0]?.text ?? '', from: body[0].detectedLanguage?.language ?? '' }
+  return { out: body[0].translations?.[0]?.text ?? '', from: body[0].detectedLanguage?.language ?? '' }
 }
 
 /* ---------------- 模型（$.model.complete，走本会话凭证） ---------------- */
 
-const MODEL_SYSTEM =
-  'Translate the user message into Simplified Chinese. ' +
+const MODEL_SYSTEM = () =>
+  `Translate the user message into ${langName()}. ` +
   'Preserve the markdown structure exactly: lists, headings, tables, inline code, emphasis, links. ' +
   'Keep code, identifiers, file paths, commands and URLs unchanged. ' +
+  `If the message is already entirely in ${langName()}, return it exactly unchanged. ` +
   'Return ONLY the translation, no preamble, no notes.'
 
-async function modelFetch($, text) {
+async function modelFetch($, text, system) {
   const r = await $.model.complete({
     model: cfg.model,
-    system: MODEL_SYSTEM,
+    system: system ?? MODEL_SYSTEM(),
     prompt: text,
     maxTokens: 4000,
     timeoutMs: MODEL_TIMEOUT,
   })
   if (!r.isAnswered) throw new Error(`model did not answer (${r.reason ?? 'unknown'})`)
-  return { zh: r.text.trim(), from: '' }
+  return { out: r.text.trim(), from: '' }
 }
 
 /* ---------------- OpenAI 兼容（本地 llama.cpp / 远端兼容服务） ---------------- */
 
-const OPENAI_SYSTEM =
-  'Translate into Simplified Chinese. Keep code, identifiers, file paths, commands and URLs unchanged. ' +
+const OPENAI_SYSTEM = () =>
+  `Translate into ${langName()}. Keep code, identifiers, file paths, commands and URLs unchanged. ` +
+  `If it is already entirely in ${langName()}, return it exactly unchanged. ` +
   'Preserve the markdown structure. Return ONLY the translation.'
 
 /** 剥掉推理模型可能带的 <think>...</think>（哪怕为空） */
@@ -80,14 +102,14 @@ function stripThink(s) {
   return s.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
 }
 
-async function openaiFetch($, text) {
+async function openaiFetch($, text, system) {
   const base = cfg.baseUrl.replace(/\/+$/, '')
   const payload = JSON.stringify({
     model: cfg.model,
     stream: false,
     temperature: 0.2,
     messages: [
-      { role: 'system', content: OPENAI_SYSTEM },
+      { role: 'system', content: system ?? OPENAI_SYSTEM() },
       { role: 'user', content: text },
     ],
   })
@@ -98,26 +120,39 @@ async function openaiFetch($, text) {
   const r = await $.process.run(args)
   if (r.exitCode !== 0) throw new Error(`openai curl exit ${r.exitCode}`)
   const body = JSON.parse(r.stdout)
-  const zh = stripThink(String(body?.choices?.[0]?.message?.content ?? ''))
-  if (!zh) throw new Error('openai empty completion')
-  return { zh, from: '' }
+  const en = stripThink(String(body?.choices?.[0]?.message?.content ?? ''))
+  if (!en) throw new Error('openai empty completion')
+  return { out: en, from: '' }
 }
 
-/** 段落是否本来就是中文为主（模型/本地模型翻译前先本地判断，省 token） */
+/** 段落是否是 CJK 为主（zh 系目标翻译前先本地判断，省 token） */
 function isMostlyZh(s) {
   const cjk = (s.match(/[\u4e00-\u9fff]/g) || []).length
   const letters = (s.match(/[A-Za-z]/g) || []).length
   return cjk > 0 && cjk >= letters
 }
 
+/**
+ * 回复侧：段落是否已经是目标语言为主。只有 zh 系目标有可靠的本地判断（CJK 字符好数）；
+ * 其他目标语言没有便宜的本地判断，交给接口的源语言检测 / 提示词的「已是目标语言
+ * 则原样返回」约定（见 translateProse 的逐块比对）。
+ */
+function isMostlyTarget(s) {
+  return /^zh/i.test(cfg.lang) ? isMostlyZh(s) : false
+}
+
 /* ---------------- 管线 ---------------- */
 
-const fetchOne = ($, text) =>
-  cfg.provider === 'model' ? modelFetch($, text) : cfg.provider === 'openai' ? openaiFetch($, text) : msFetch($, text)
+const fetchOne = ($, text, opts = {}) =>
+  cfg.provider === 'session'
+    ? modelFetch($, text, opts.system)
+    : cfg.provider === 'openai'
+      ? openaiFetch($, text, opts.system)
+      : msFetch($, text, opts.to)
 
-/** 一段散文按空行切块翻译；源语言是中文时返回 null（不用翻） */
+/** 一段散文按空行切块翻译；源语言已是目标语言时返回 null（不用翻） */
 async function translateProse($, text) {
-  if (cfg.provider !== 'microsoft' && isMostlyZh(text)) return null
+  if (cfg.provider !== 'microsoft' && isMostlyTarget(text)) return null
 
   const chunks = []
   let cur = ''
@@ -133,19 +168,26 @@ async function translateProse($, text) {
 
   const out = []
   let srcLang = ''
+  let any = false
   for (const chunk of chunks) {
     const r = await fetchOne($, chunk)
     srcLang = r.from || srcLang
-    out.push(r.zh)
+    // 模型判定「已是目标语言」会原样返回：该块保持原文、不算翻过
+    if (r.out.trim() && r.out.trim() !== chunk.trim()) {
+      out.push(r.out)
+      any = true
+    } else {
+      out.push(chunk)
+    }
   }
-  if (cfg.provider === 'microsoft' && /^zh/i.test(srcLang)) return null
-  return out.join('\n\n')
+  if (cfg.provider === 'microsoft' && sameLang(srcLang, cfg.lang)) return null
+  return any ? out.join('\n\n') : null
 }
 
 /**
  * 翻一个消息块，逐段穿插：每段原文下面直接跟它自己的 `> ` 译文；
  * ``` 代码块不送翻也不插入译文。返回拼好的完整 markdown，
- * 全部跳过（中文/无散文）时返回 null。
+ * 全部跳过（已是目标语言/无散文）时返回 null。
  * 段落并行翻（并发 4）：本地 llama.cpp 有连续 batching，串行会让长回复等几十秒。
  */
 async function translateBlock($, text) {
@@ -189,6 +231,78 @@ async function translateBlock($, text) {
   return any ? out.join('\n\n') : null
 }
 
+/* ---------------- 出站：保证发给模型的一定是英文 ---------------- */
+
+const OUT_MODEL_SYSTEM = () =>
+  'The message is a prompt on its way to a coding agent. Rewrite it into natural, grammatically correct English: ' +
+  'if it is in another language, translate it faithfully without changing the meaning; if it is already in English, ' +
+  'fix only grammar, spelling and typography errors. Never change the meaning, tone or technical content. ' +
+  `The author's first language is ${langName()}; keep the English plain and idiomatic. ` +
+  'Preserve the markdown structure; keep code, identifiers, file paths, commands, flags and URLs unchanged. ' +
+  'If nothing needs changing, return the text exactly as given. ' +
+  'Return ONLY the rewritten text, no preamble, no notes.'
+
+const OUT_OPENAI_SYSTEM = () =>
+  'Rewrite the prompt into natural, grammatically correct English: translate it faithfully if it is in another ' +
+  'language, or fix only grammar/spelling/typo errors if it is already English. Never change the meaning. ' +
+  `The author's first language is ${langName()}. ` +
+  'Keep code, identifiers, file paths, commands and URLs unchanged. Preserve the markdown structure. ' +
+  'If nothing needs changing, return the text exactly as given. Return ONLY the rewritten text.'
+
+/**
+ * 出站一段散文：转成英文；已是英文且无需改动时返回 null（保持原文）。
+ * microsoft 靠接口自带的源语言检测；session/openai 一条提示词同时覆盖
+ * 「其他语言→翻译」和「英文→修语法」，由模型自己判断走哪条。
+ */
+async function ensureEnglishProse($, text) {
+  if (cfg.provider === 'microsoft') {
+    const r = await msFetch($, text, 'en')
+    if (/^en(-|$)/i.test(r.from)) return null // 本来就是英文（免费接口没有语法检查能力）
+    return r.out.trim() || null
+  }
+  const system = cfg.provider === 'session' ? OUT_MODEL_SYSTEM() : OUT_OPENAI_SYSTEM()
+  const r = await fetchOne($, text, { system })
+  const en = r.out.trim()
+  return en && en !== text.trim() ? en : null
+}
+
+/** 出站整块：``` 代码围栏不动，散文段并发处理；返回 { text, changed }（没改动时 text 即原文） */
+async function outboundBlock($, text) {
+  const paras = [] // { code } | { text, en? }
+  for (const part of text.split(/(```[\s\S]*?```)/g)) {
+    if (!part.trim()) continue
+    if (part.startsWith('```')) {
+      paras.push({ code: part })
+      continue
+    }
+    for (const para of part.split(/\n{2,}/)) {
+      if (para.trim()) paras.push({ text: para })
+    }
+  }
+
+  const POOL = 4
+  let cursor = 0
+  const worker = async () => {
+    while (cursor < paras.length) {
+      const p = paras[cursor++]
+      if (p.code !== undefined) continue
+      try {
+        const en = await ensureEnglishProse($, p.text)
+        if (en) p.en = en
+      } catch { /* 单段失败放原文，绝不拦提示词 */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(POOL, paras.length) }, worker))
+
+  let any = false
+  const out = paras.map((p) => {
+    if (p.code !== undefined) return p.code
+    if (p.en) any = true
+    return p.en ?? p.text
+  })
+  return { text: any ? out.join('\n\n') : text, changed: any }
+}
+
 /** 诊断：写 /tmp/pt-live.log（只记关键转移，保留最近 60 条） */
 const dbg = []
 function diag($, msg) {
@@ -230,16 +344,20 @@ function onRenderText($, text) {
 
 export function register(on, options) {
   // userConfig（/config 面板或 settings.json 的 pluginConfigs["parrot-translate@inline"]）
-  cfg.showByDefault = options?.show_by_default === true
-  cfg.provider = ['model', 'openai'].includes(options?.provider) ? options.provider : 'microsoft'
+  cfg.showByDefault = options?.show_by_default !== false // 默认 true（0.4.3 起）
+  cfg.outbound = options?.outbound !== false
+  cfg.lang = typeof options?.lang === 'string' && options.lang.trim() ? options.lang.trim() : 'zh-Hans'
+  // 旧值 model（≤0.4.1）兼容：映射为 session
+  const providerRaw = typeof options?.provider === 'string' ? options.provider.trim() : ''
+  cfg.provider = providerRaw === 'model' ? 'session' : ['session', 'openai'].includes(providerRaw) ? providerRaw : 'microsoft'
   cfg.model = typeof options?.model === 'string' && options.model.trim() ? options.model.trim() : 'haiku'
   cfg.baseUrl = typeof options?.base_url === 'string' && options.base_url.trim() ? options.base_url.trim() : 'http://127.0.0.1:8021/v1'
   cfg.apiKey = typeof options?.api_key === 'string' ? options.api_key : ''
   show = cfg.showByDefault
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'translate', description: 'Show/hide Chinese translation of replies' })
-    diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault}`)
+    await $.command.register({ name: 'translate', description: 'Show/hide translation of replies' })
+    diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault} outbound=${cfg.outbound} lang=${cfg.lang}`)
     return next(e)
   })
 
@@ -279,5 +397,32 @@ export function register(on, options) {
 
     // 缓存里已是拼好的逐段穿插版本，直接替换显示文本（只影响渲染，不落盘不进上下文）
     return next({ ...e, props: { ...e.props, text: entry.md } })
+  })
+
+  // 出站：本机敲 Enter 的提示词改写成英文再进会话（插件/peer/通知的提交不动）
+  on('prompt.submit', { origin: { kind: 'composer' } }, async ($, e, next) => {
+    const text = e.text ?? ''
+    if (!cfg.outbound || !text.trim() || text.startsWith('/')) return next(e)
+    try {
+      if (cfg.provider !== 'microsoft' && text.length > 120) $.ui.toast('正在把提示词转成英文…')
+      const { text: en, changed } = await outboundBlock($, text)
+      if (!changed || !en.trim()) return next(e)
+      outboundMap.set(en, text) // 先入映射再 next，跟上的重渲染直接能画对照
+      diag($, `outbound len=${text.length} -> ${en.length}`)
+      // 模型与落盘都是英文；屏幕上的用户行跟着变英文，由下面的渲染钩子画成双语对照
+      return next({ ...e, text: en })
+    } catch (err) {
+      diag($, `outbound error: ${String((err && err.message) || err).slice(0, 150)}`)
+      return next(e) // 任何失败都原样放行，绝不拦提示词
+    }
+  })
+
+  // 用户消息行的双语对照：原文在上，实际发出的英文 `> ` 引用在下（只影响渲染）
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const text = e.props?.text
+    const orig = text ? outboundMap.get(text) : undefined
+    if (orig === undefined) return next(e)
+    const quote = text.split('\n').map((l) => `> ${l}`).join('\n')
+    return next({ ...e, props: { ...e.props, text: `${orig}\n\n${quote}` } })
   })
 }
