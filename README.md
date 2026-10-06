@@ -2,6 +2,8 @@
 
 面向 code agent 的语言辅助扩展，分别为 Claude Code 和 pi 提供实现。目前在维护的只有 parrot-translate：发出的 prompt 保证为地道英文，回复按需译回配置的语言。
 
+![parrot-translate 效果](docs/screenshot.png)
+
 ## 组成
 
 - [claude/parrot-translate](./claude/parrot-translate)：Claude Code 插件。提交时将 prompt 改写为地道英文，用户消息行双语对照；回复在后台译成 `lang` 配置的语言，`Ctrl+Y` 切换显示
