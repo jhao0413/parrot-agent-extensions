@@ -24,3 +24,4 @@ claude plugin install parrot-translate@parrot-agent-extensions
 - 对话上下文里只有英文：出站改写走 `prompt.submit`，进会话前替换；回复译文只改渲染层；模型翻译走 `$.model.complete`，无历史独立补全
 - 凭据默认走微软免费接口，也可以配会话凭证模型（`session`）或 OpenAI 兼容端点（本地 llama.cpp 等）
 - 目标语言由 `lang` 配置，没有写死的语言
+- 粘贴的错误信息、堆栈、JSON、日志、diff 自动跳过不翻；``` 围栏在结构层就不送翻

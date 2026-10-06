@@ -5,6 +5,7 @@
  * 逐段穿插：每段原文下面直接跟它自己的 `> ` 译文。
  * 出站：prompt.submit 时把提示词改写成英文（其他语言忠实翻译；英文只修语法，
  * 不改意思），模型与 transcript 收到的都是英文；用户消息行渲染成双语对照。
+ * 粘贴的技术性内容（错误信息/堆栈/JSON/日志/diff）两侧都不送翻，原样放行。
  *
  * 翻译服务（/config 里换，见 plugin.json 的 userConfig）：
  *  - microsoft（默认）：Edge 免费接口（与 parrot 扩展同款），无需 key
@@ -12,8 +13,10 @@
  *
  * 注：hooks module 只能 import 相对路径和 "claude-code"，所以没有外部依赖。
  */
-const MAX_CHARS = 3000 // 单次请求的字符上限（微软同款留余量）
+const MAX_CHARS = 3000 // 单次请求的字符上限（微软同款留余量；出站超长段也按它切块）
 const MODEL_TIMEOUT = 30_000
+const MAX_TOKENS = 16_000 // 单次补全输出上限：3000 字符块的重写远用不满，防静默截断
+const MAP_CAP = 500 // cache / outboundMap 条目上限（FIFO 淘汰最旧，防长会话无限增长）
 
 /** userConfig 传入的配置（register 时初始化） */
 const cfg = { showByDefault: false, outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
@@ -26,6 +29,12 @@ const cache = new Map()
 
 /** 发出的英文 -> 用户原话：UserMessage 渲染层做双语对照（不落盘、不进上下文） */
 const outboundMap = new Map()
+
+/** Map.set + FIFO 上限。代价：滚回很早的消息会丢缓存（回复侧重翻一次）或丢双语对照（回落英文行） */
+function putCapped(map, key, val) {
+  if (!map.has(key) && map.size >= MAP_CAP) map.delete(map.keys().next().value)
+  map.set(key, val)
+}
 
 /**
  * 防抖调度：流式期间每次渲染都会重置 1.5s 计时器，文本稳定（流结束）后才真正去翻。
@@ -83,7 +92,7 @@ async function modelFetch($, text, system) {
     model: cfg.model,
     system: system ?? MODEL_SYSTEM(),
     prompt: text,
-    maxTokens: 4000,
+    maxTokens: MAX_TOKENS,
     timeoutMs: MODEL_TIMEOUT,
   })
   if (!r.isAnswered) throw new Error(`model did not answer (${r.reason ?? 'unknown'})`)
@@ -120,6 +129,7 @@ async function openaiFetch($, text, system) {
   const r = await $.process.run(args)
   if (r.exitCode !== 0) throw new Error(`openai curl exit ${r.exitCode}`)
   const body = JSON.parse(r.stdout)
+  if (body?.choices?.[0]?.finish_reason === 'length') throw new Error('openai truncated (finish_reason=length)')
   const en = stripThink(String(body?.choices?.[0]?.message?.content ?? ''))
   if (!en) throw new Error('openai empty completion')
   return { out: en, from: '' }
@@ -141,7 +151,80 @@ function isMostlyTarget(s) {
   return /^zh/i.test(cfg.lang) ? isMostlyZh(s) : false
 }
 
+/**
+ * 段落是否是「技术性粘贴」：错误信息、堆栈、JSON、日志、diff、十六进制/表格等。
+ * 这些内容翻译/改写只会帮倒忙，两侧（出站与回复）都直接跳过；要百分之百确保
+ * 原样，用 ``` 围栏包住（围栏在结构层就不送翻）。规则各自独立、偏保守，
+ * 像散文的内容一条都不该命中。
+ */
+function looksTechnical(s) {
+  const t = s.trim()
+  if (!t) return false
+  // JSON（或接近 JSON：粘贴时头尾缺行很常见）
+  if (/^[[{]/.test(t)) {
+    try { JSON.parse(t); return true } catch { /* 不完整，看下面的规则 */ }
+    if ((t.match(/":\s/g) || []).length >= 2) return true
+  }
+  // 堆栈：JS 的 at fn (file:1:2) / Python 的 Traceback + File "...", line N
+  if (/^\s*at\s+[\w$.#<>-]+\s*\(.*:\d+:\d+\)/m.test(t)) return true
+  if (/Traceback \(most recent call last\)|File ".*", line \d+/.test(t)) return true
+  // 日志行：时间戳或等级开头的行
+  if (/^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/m.test(t)) return true
+  if (/^\[?(ERROR|WARN|WARNING|INFO|DEBUG|FATAL|CRITICAL|TRACE|NOTICE)[\]:]/m.test(t)) return true
+  if (/^npm (ERR!|WARN)/m.test(t)) return true
+  // diff / patch
+  if (/^(diff --git |@@ -\d+(,\d+)? \+\d+(,\d+)? @@|--- a\/|\+\+\+ b\/)/m.test(t)) return true
+  // 符号密度：字母+CJK 占非空白字符不到 35%（十六进制、base64、表格、URL 堆）
+  const ns = t.replace(/\s/g, '')
+  const word = (ns.match(/[A-Za-z\u4e00-\u9fff]/g) || []).length
+  return ns.length >= 40 && word / ns.length < 0.35
+}
+
 /* ---------------- 管线 ---------------- */
+
+/** 把消息块拆成段：``` 围栏整段保留为 { code }，散文按空行分段为 { text } */
+function splitParas(text) {
+  const paras = []
+  for (const part of text.split(/(```[\s\S]*?```)/g)) {
+    if (!part.trim()) continue
+    if (part.startsWith('```')) {
+      paras.push({ code: part })
+      continue
+    }
+    // 散文部分按空行分段（列表内部是单换行，会被当成一段整体翻，保留结构）
+    for (const para of part.split(/\n{2,}/)) if (para.trim()) paras.push({ text: para })
+  }
+  return paras
+}
+
+/** 固定并发跑一批任务（worker 内部自行 try/catch，单条失败不外溢） */
+async function runPool(items, size, worker) {
+  let cursor = 0
+  const run = async () => {
+    while (cursor < items.length) await worker(items[cursor++])
+  }
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, run))
+}
+
+/** 超长段落（无空行可分段）按行边界切块；单行仍超限就按 max 硬切 */
+function chunkParagraph(s, max = MAX_CHARS) {
+  if (s.length <= max) return [s]
+  const chunks = []
+  let cur = ''
+  for (const line of s.split('\n')) {
+    if (line.length > max) {
+      if (cur) { chunks.push(cur); cur = '' }
+      for (let i = 0; i < line.length; i += max) chunks.push(line.slice(i, i + max))
+    } else if (cur && cur.length + line.length + 1 > max) {
+      chunks.push(cur)
+      cur = line
+    } else {
+      cur = cur ? `${cur}\n${line}` : line
+    }
+  }
+  if (cur) chunks.push(cur)
+  return chunks
+}
 
 const fetchOne = ($, text, opts = {}) =>
   cfg.provider === 'session'
@@ -152,6 +235,7 @@ const fetchOne = ($, text, opts = {}) =>
 
 /** 一段散文按空行切块翻译；源语言已是目标语言时返回 null（不用翻） */
 async function translateProse($, text) {
+  if (looksTechnical(text)) return null
   if (cfg.provider !== 'microsoft' && isMostlyTarget(text)) return null
 
   const chunks = []
@@ -191,33 +275,14 @@ async function translateProse($, text) {
  * 段落并行翻（并发 4）：本地 llama.cpp 有连续 batching，串行会让长回复等几十秒。
  */
 async function translateBlock($, text) {
-  const paras = [] // { index, out: [原文, 译文?] }
-  let i = 0
-  for (const part of text.split(/(```[\s\S]*?```)/g)) {
-    if (!part.trim()) continue
-    if (part.startsWith('```')) {
-      paras.push({ code: part })
-      continue
-    }
-    // 散文部分按空行分段（列表内部是单换行，会被当成一段整体翻，保留结构）
-    for (const para of part.split(/\n{2,}/)) {
-      if (para.trim()) paras.push({ text: para })
-    }
-  }
-
-  const POOL = 4
-  let cursor = 0
-  const worker = async () => {
-    while (cursor < paras.length) {
-      const p = paras[cursor++]
-      if (p.code !== undefined) continue
-      try {
-        const zh = await translateProse($, p.text)
-        if (zh) p.zh = zh
-      } catch { /* 单段失败不影响其它段 */ }
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(POOL, paras.length) }, worker))
+  const paras = splitParas(text)
+  await runPool(paras, 4, async (p) => {
+    if (p.code !== undefined) return
+    try {
+      const zh = await translateProse($, p.text)
+      if (zh) p.zh = zh
+    } catch { /* 单段失败不影响其它段 */ }
+  })
 
   const out = []
   let any = false
@@ -255,44 +320,41 @@ const OUT_OPENAI_SYSTEM = () =>
  * 「其他语言→翻译」和「英文→修语法」，由模型自己判断走哪条。
  */
 async function ensureEnglishProse($, text) {
+  if (looksTechnical(text)) return null // 粘贴的错误信息/JSON/日志等原样放行
   if (cfg.provider === 'microsoft') {
-    const r = await msFetch($, text, 'en')
-    if (/^en(-|$)/i.test(r.from)) return null // 本来就是英文（免费接口没有语法检查能力）
-    return r.out.trim() || null
+    // 超长段按行边界切块逐块送翻；首块检测出英文即整段放行（免费接口没有语法检查能力）
+    const chunks = chunkParagraph(text)
+    const out = []
+    let any = false
+    for (let i = 0; i < chunks.length; i++) {
+      const r = await msFetch($, chunks[i], 'en')
+      if (i === 0 && /^en(-|$)/i.test(r.from)) return null
+      const en = r.out.trim()
+      if (en && en !== chunks[i].trim()) { out.push(en); any = true } else out.push(chunks[i])
+    }
+    return any ? out.join('\n') : null
   }
   const system = cfg.provider === 'session' ? OUT_MODEL_SYSTEM() : OUT_OPENAI_SYSTEM()
-  const r = await fetchOne($, text, { system })
-  const en = r.out.trim()
-  return en && en !== text.trim() ? en : null
+  const out = []
+  let any = false
+  for (const chunk of chunkParagraph(text)) {
+    const r = await fetchOne($, chunk, { system })
+    const en = r.out.trim()
+    if (en && en !== chunk.trim()) { out.push(en); any = true } else out.push(chunk)
+  }
+  return any ? out.join('\n') : null
 }
 
 /** 出站整块：``` 代码围栏不动，散文段并发处理；返回 { text, changed }（没改动时 text 即原文） */
 async function outboundBlock($, text) {
-  const paras = [] // { code } | { text, en? }
-  for (const part of text.split(/(```[\s\S]*?```)/g)) {
-    if (!part.trim()) continue
-    if (part.startsWith('```')) {
-      paras.push({ code: part })
-      continue
-    }
-    for (const para of part.split(/\n{2,}/)) {
-      if (para.trim()) paras.push({ text: para })
-    }
-  }
-
-  const POOL = 4
-  let cursor = 0
-  const worker = async () => {
-    while (cursor < paras.length) {
-      const p = paras[cursor++]
-      if (p.code !== undefined) continue
-      try {
-        const en = await ensureEnglishProse($, p.text)
-        if (en) p.en = en
-      } catch { /* 单段失败放原文，绝不拦提示词 */ }
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(POOL, paras.length) }, worker))
+  const paras = splitParas(text)
+  await runPool(paras, 4, async (p) => {
+    if (p.code !== undefined) return
+    try {
+      const en = await ensureEnglishProse($, p.text)
+      if (en) p.en = en
+    } catch { /* 单段失败放原文，绝不拦提示词 */ }
+  })
 
   let any = false
   const out = paras.map((p) => {
@@ -313,11 +375,11 @@ function diag($, msg) {
 
 function scheduleOne($, text) {
   if (cache.has(text)) return
-  cache.set(text, { state: 'pending' })
+  putCapped(cache, text, { state: 'pending' })
   diag($, `schedule len=${text.length}`)
   translateBlock($, text)
     .then((md) => {
-      cache.set(text, { state: md ? 'done' : 'skip', md })
+      putCapped(cache, text, { state: md ? 'done' : 'skip', md })
       diag($, `done len=${text.length} ${md ? 'md=' + md.length : 'skip'}`)
       if (show) {
         $.ui.invalidate('ui.render')
@@ -325,7 +387,7 @@ function scheduleOne($, text) {
       }
     })
     .catch((err) => {
-      cache.set(text, { state: 'error' })
+      putCapped(cache, text, { state: 'error' })
       diag($, `error len=${text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
       if (show) $.ui.toast('翻译失败，见 /tmp/pt-live.log')
     })
@@ -382,12 +444,10 @@ export function register(on, options) {
     const text = e.props?.text
     if (!text || !text.trim()) return next(e)
 
-    // 默认就翻（与显示无关）：防抖 1.5s，文本稳定后才调度（见 onRenderText）
-    let entry = cache.get(text)
-    if (!entry) {
-      onRenderText($, text)
-      entry = cache.get(text)
-    }
+    // 默认就翻（与显示无关）：防抖 1.5s，文本稳定后才调度（见 onRenderText）。
+    // onRenderText 只登记防抖，不会同步写 cache，这里不必重读。
+    const entry = cache.get(text)
+    if (!entry) onRenderText($, text)
 
     if (!show) return next(e)
 
@@ -407,7 +467,7 @@ export function register(on, options) {
       if (cfg.provider !== 'microsoft' && text.length > 120) $.ui.toast('正在把提示词转成英文…')
       const { text: en, changed } = await outboundBlock($, text)
       if (!changed || !en.trim()) return next(e)
-      outboundMap.set(en, text) // 先入映射再 next，跟上的重渲染直接能画对照
+      putCapped(outboundMap, en, text) // 先入映射再 next，跟上的重渲染直接能画对照
       diag($, `outbound len=${text.length} -> ${en.length}`)
       // 模型与落盘都是英文；屏幕上的用户行跟着变英文，由下面的渲染钩子画成双语对照
       return next({ ...e, text: en })
