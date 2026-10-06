@@ -26,3 +26,7 @@ claude plugin install parrot-translate@parrot-agent-extensions
 - 凭据默认走微软免费接口，也可以配会话凭证模型（`session`）或 OpenAI 兼容端点（本地 llama.cpp 等）
 - 目标语言不写死，由 `lang` 配置决定
 - 粘贴的错误信息、堆栈、JSON、日志、diff 自动跳过不翻；``` 围栏在结构层就不送翻
+
+## 致谢
+
+感谢 [Linux.do 社区](https://linux.do) 的支持与帮助。
