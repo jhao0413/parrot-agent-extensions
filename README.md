@@ -13,7 +13,7 @@
 ## 安装（parrot-translate）
 
 ```bash
-claude plugin marketplace add jhao/parrot-agent-extensions
+claude plugin marketplace add jhao0413/parrot-agent-extensions
 claude plugin install parrot-translate@parrot-agent-extensions
 ```
 
