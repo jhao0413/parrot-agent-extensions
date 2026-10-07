@@ -524,7 +524,7 @@ async function ensureEnglishProse($, text) {
     }
     return any ? out.join('') : null
   }
-  const system = nonLatinLetterCount(text) || !isLikelyEnglish(text)
+  const system = nonLatinLetterCount(text)
     ? OUT_TRANSLATE_RETRY_SYSTEM()
     : cfg.provider === 'session' ? OUT_MODEL_SYSTEM() : OUT_OPENAI_SYSTEM()
   const out = []

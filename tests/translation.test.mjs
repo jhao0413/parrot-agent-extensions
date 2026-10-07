@@ -137,6 +137,15 @@ for (const runtime of ['pi', 'claude']) {
       }
     })
 
+    test(`${runtime}/${provider}: short English fragments receive the grammar rewrite instruction`, async () => {
+      const h = load(runtime, { config: { provider }, answer: (_prompt, _n, payload) => {
+        assert.match(payload.messages[0].content, /grammar/)
+        return 'The Claude Code plugin, too.'
+      } })
+      assert.equal(await submit(runtime, h, 'claude code plugin also'), 'The Claude Code plugin, too.')
+      assert.equal(h.calls.length, 1)
+    })
+
     test(`${runtime}/${provider}: unchanged provider responses submit the exact original`, async () => {
       const text = '  fix all  '
       const h = load(runtime, { config: { provider }, answer: prompt => prompt })

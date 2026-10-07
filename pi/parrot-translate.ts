@@ -594,7 +594,7 @@ async function ensureEnglishProse(ctx: ExtensionContext, text: string) {
 		}
 		return any ? out.join("") : null
 	}
-	const system = nonLatinCount(text) || !isLikelyEnglish(text)
+	const system = nonLatinCount(text)
 		? OUT_RETRY_SYSTEM
 		: cfg.provider === "session" ? OUT_MODEL_SYSTEM() : OUT_OPENAI_SYSTEM()
 	const out: string[] = []
