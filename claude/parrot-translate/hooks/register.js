@@ -36,6 +36,17 @@ function putCapped(map, key, val) {
   map.set(key, val)
 }
 
+function putOutboundMap(en, orig) {
+  const old = outboundMap.get(en)
+  if (old === undefined) {
+    putCapped(outboundMap, en, orig)
+  } else if (old !== orig) {
+    // 渲染层只给文本、不给稳定 message id；同一英文来自不同原文时无法安全归属。
+    // 标成 ambiguous，避免把旧消息重标成最新原文。
+    putCapped(outboundMap, en, null)
+  }
+}
+
 /**
  * 防抖调度：流式期间每次渲染都会重置 1.5s 计时器，文本稳定（流结束）后才真正去翻。
  * 不依赖 turn.start/turn.complete —— 实测它们不一定触发，一旦不触发整条管线就死掉。
@@ -75,7 +86,9 @@ async function msFetch($, text, to = cfg.lang) {
   if (!res.ok) throw new Error(`microsoft HTTP ${res.status}`)
   const body = parseBody(res)
   if (!Array.isArray(body) || body.length !== 1) throw new Error('microsoft bad response')
-  return { out: body[0].translations?.[0]?.text ?? '', from: body[0].detectedLanguage?.language ?? '' }
+  const out = body[0].translations?.[0]?.text
+  if (typeof out !== 'string' || !out.trim()) throw new Error('microsoft empty translation')
+  return { out, from: body[0].detectedLanguage?.language ?? '' }
 }
 
 /* ---------------- 模型（$.model.complete，走本会话凭证） ---------------- */
@@ -171,29 +184,120 @@ function looksTechnical(s) {
   // 日志行：时间戳或等级开头的行
   if (/^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/m.test(t)) return true
   if (/^\[?(ERROR|WARN|WARNING|INFO|DEBUG|FATAL|CRITICAL|TRACE|NOTICE)[\]:]/m.test(t)) return true
+  if (/^\[?(error|exception|panic)\]?:/im.test(t)) return true // Error:/Exception: 等常见报错前缀（标题大小写）
   if (/^npm (ERR!|WARN)/m.test(t)) return true
   // diff / patch
   if (/^(diff --git |@@ -\d+(,\d+)? \+\d+(,\d+)? @@|--- a\/|\+\+\+ b\/)/m.test(t)) return true
-  // 符号密度：字母+CJK 占非空白字符不到 35%（十六进制、base64、表格、URL 堆）
+  // 符号密度：Unicode 字母/组合符号占非空白字符不到 35%。
   const ns = t.replace(/\s/g, '')
-  const word = (ns.match(/[A-Za-z\u4e00-\u9fff]/g) || []).length
+  const word = (ns.match(/[\p{L}\p{M}]/gu) || []).length
   return ns.length >= 40 && word / ns.length < 0.35
 }
 
 /* ---------------- 管线 ---------------- */
 
-/** 把消息块拆成段：``` 围栏整段保留为 { code }，散文按空行分段为 { text } */
+/** Preserve raw text while recognizing code relative to list and blockquote containers. */
 function splitParas(text) {
   const paras = []
-  for (const part of text.split(/(```[\s\S]*?```)/g)) {
-    if (!part.trim()) continue
-    if (part.startsWith('```')) {
-      paras.push({ code: part })
-      continue
-    }
-    // 散文部分按空行分段（列表内部是单换行，会被当成一段整体翻，保留结构）
-    for (const para of part.split(/\n{2,}/)) if (para.trim()) paras.push({ text: para })
+  const lists = new Map()
+  let previousQuoteDepth = 0
+  let prose = ""
+  let code = ""
+  let fence
+  let indented
+  const flushProse = () => {
+    if (prose) paras.push({ text: prose })
+    prose = ""
   }
+  const flushCode = () => {
+    if (code) paras.push({ code })
+    code = ""
+  }
+  // Expand tabs only in the parsing view. The original bytes always form the output.
+  const viewLine = (body, allowLists, maxQuotes = Infinity) => {
+    let rest = ""
+    for (const ch of body) rest += ch === "\t" ? " ".repeat(4 - rest.length % 4) : ch
+    let quoteDepth = 0
+    let listIndent = 0
+    // Lists and quotes can alternate at any depth, e.g. "- > - ```".
+    while (true) {
+      let quote
+      while (quoteDepth < maxQuotes && (quote = rest.match(/^ {0,3}> ?/))) {
+        rest = rest.slice(quote[0].length)
+        quoteDepth++
+      }
+      const stack = lists.get(quoteDepth) ?? []
+      lists.set(quoteDepth, stack)
+      const blank = !rest.trim()
+      const indent = rest.match(/^ */)[0].length
+      if (!blank) while (stack.length && stack[stack.length - 1] > indent) stack.pop()
+      listIndent = stack[stack.length - 1] ?? 0
+      let offset = 0
+      let marker
+      while (allowLists && (marker = rest.match(/^( *)([-+*]|\d{1,9}[.)])( +|$)/)) &&
+        marker[1].length <= (offset ? 0 : listIndent) + 3) {
+        const padding = marker[3].length > 4 ? 1 : marker[3].length || 1
+        const width = marker[1].length + marker[2].length + padding
+        offset += width
+        listIndent = offset
+        stack.push(listIndent)
+        rest = rest.slice(width)
+      }
+      if (!offset) rest = rest.slice(listIndent)
+      if (quoteDepth >= maxQuotes || !/^ {0,3}> ?/.test(rest)) break
+    }
+    if (quoteDepth < previousQuoteDepth) {
+      for (const depth of lists.keys()) if (depth > quoteDepth) lists.delete(depth)
+    }
+    previousQuoteDepth = quoteDepth
+    return { body: rest, quoteDepth, listIndent, blank: !rest.trim() }
+  }
+  const inContainer = (line, start) =>
+    line.quoteDepth >= start.quoteDepth && (line.blank || line.listIndent >= start.listIndent)
+  for (const raw of text.match(/[^\n]*(?:\n|$)/g)?.filter(Boolean) ?? []) {
+    const body = raw.replace(/\r?\n$/, "")
+    // Once code starts, further quote markers belong to its literal contents.
+    let line = viewLine(body, !fence && !indented, (fence ?? indented)?.quoteDepth)
+    if (fence) {
+      if (inContainer(line, fence)) {
+        code += raw
+        if (fence.closing.test(line.body)) { flushCode(); fence = undefined }
+        continue
+      }
+      flushCode()
+      fence = undefined
+      line = viewLine(body, true)
+    }
+    if (indented) {
+      if (inContainer(line, indented) && (line.blank || /^ {4}/.test(line.body))) {
+        code += raw
+        continue
+      }
+      flushCode()
+      indented = undefined
+      line = viewLine(body, true)
+    }
+    const opening = line.body.match(/^ {0,3}(`{3,}|~{3,})(.*)$/)
+    if (opening && !(opening[1][0] === "`" && opening[2].includes("`"))) {
+      flushProse()
+      code = raw
+      fence = { ...line, closing: new RegExp(`^ {0,3}${opening[1][0]}{${opening[1].length},}[ ]*$`) }
+    } else if (/^(`+)[^\n]*\1[ ]*$/.test(line.body)) {
+      // Pi's Mermaid renderer emits standalone inline-code rows.
+      flushProse()
+      paras.push({ code: raw })
+    } else if (!line.blank && /^ {4}/.test(line.body) && !prose.trim()) {
+      code = raw
+      indented = line
+    } else if (line.blank) {
+      flushProse()
+      paras.push({ code: raw })
+    } else {
+      prose += raw
+    }
+  }
+  flushProse()
+  flushCode()
   return paras
 }
 
@@ -206,24 +310,32 @@ async function runPool(items, size, worker) {
   await Promise.all(Array.from({ length: Math.min(size, items.length) }, run))
 }
 
-/** 超长段落（无空行可分段）按行边界切块；单行仍超限就按 max 硬切 */
+/** Bound requests while retaining every separator and avoiding split surrogate pairs. */
 function chunkParagraph(s, max = MAX_CHARS) {
-  if (s.length <= max) return [s]
   const chunks = []
-  let cur = ''
-  for (const line of s.split('\n')) {
-    if (line.length > max) {
-      if (cur) { chunks.push(cur); cur = '' }
-      for (let i = 0; i < line.length; i += max) chunks.push(line.slice(i, i + max))
-    } else if (cur && cur.length + line.length + 1 > max) {
-      chunks.push(cur)
-      cur = line
-    } else {
-      cur = cur ? `${cur}\n${line}` : line
+  for (let start = 0; start < s.length;) {
+    let end = Math.min(start + max, s.length)
+    if (end < s.length) {
+      const newline = s.lastIndexOf('\n', end - 1)
+      const space = s.lastIndexOf(' ', end - 1)
+      const boundary = newline >= start ? newline : space
+      if (boundary >= start) end = boundary + 1
+      else if (/[\uD800-\uDBFF]/.test(s[end - 1])) end--
     }
+    chunks.push(s.slice(start, end))
+    start = end
   }
-  if (cur) chunks.push(cur)
-  return chunks
+  return chunks.length ? chunks : [s]
+}
+
+function preserveWhitespace(source, replacement) {
+  return (source.match(/^\s*/)?.[0] ?? '') + replacement.trim() + (source.match(/\s*$/)?.[0] ?? '')
+}
+
+function quoteTranslation(text, translation) {
+  const trailing = text.match(/\s*$/)?.[0] ?? ""
+  return text.slice(0, text.length - trailing.length) + "\n\n" +
+    translation.split("\n").map((line) => `> ${line}`).join("\n") + trailing
 }
 
 const fetchOne = ($, text, opts = {}) =>
@@ -233,70 +345,69 @@ const fetchOne = ($, text, opts = {}) =>
       ? openaiFetch($, text, opts.system)
       : msFetch($, text, opts.to)
 
-/** 一段散文按空行切块翻译；源语言已是目标语言时返回 null（不用翻） */
+/** 一段散文按长度切块翻译；源语言已是目标语言的块原样保留 */
 async function translateProse($, text) {
   if (looksTechnical(text)) return null
   if (cfg.provider !== 'microsoft' && isMostlyTarget(text)) return null
 
-  const chunks = []
-  let cur = ''
-  for (const para of text.split(/\n{2,}/)) {
-    if (cur && (cur.length + para.length + 2) > MAX_CHARS) {
-      chunks.push(cur)
-      cur = para
-    } else {
-      cur = cur ? `${cur}\n\n${para}` : para
-    }
-  }
-  if (cur.trim()) chunks.push(cur)
-
   const out = []
-  let srcLang = ''
   let any = false
-  for (const chunk of chunks) {
+  for (const chunk of chunkParagraph(text)) {
     const r = await fetchOne($, chunk)
-    srcLang = r.from || srcLang
+    // 微软的检测是逐请求返回的：只能跳过当前块，不能因为某一块是目标语言就跳过整段。
+    if (cfg.provider === 'microsoft' && sameLang(r.from, cfg.lang)) {
+      out.push(chunk)
+      continue
+    }
     // 模型判定「已是目标语言」会原样返回：该块保持原文、不算翻过
     if (r.out.trim() && r.out.trim() !== chunk.trim()) {
-      out.push(r.out)
+      out.push(preserveWhitespace(chunk, r.out))
       any = true
     } else {
       out.push(chunk)
     }
   }
-  if (cfg.provider === 'microsoft' && sameLang(srcLang, cfg.lang)) return null
-  return any ? out.join('\n\n') : null
+  return any ? out.join('') : null
 }
 
 /**
  * 翻一个消息块，逐段穿插：每段原文下面直接跟它自己的 `> ` 译文；
- * ``` 代码块不送翻也不插入译文。返回拼好的完整 markdown，
- * 全部跳过（已是目标语言/无散文）时返回 null。
+ * 代码块/原始分隔符不送翻且原样拼回。返回 { md, errors }。
+ * 全部跳过（已是目标语言/无散文）时 md 为 null。
  * 段落并行翻（并发 4）：本地 llama.cpp 有连续 batching，串行会让长回复等几十秒。
  */
 async function translateBlock($, text) {
   const paras = splitParas(text)
   await runPool(paras, 4, async (p) => {
-    if (p.code !== undefined) return
+    if (p.text === undefined) return
     try {
-      const zh = await translateProse($, p.text)
-      if (zh) p.zh = zh
-    } catch { /* 单段失败不影响其它段 */ }
+      const translation = await translateProse($, p.text)
+      if (translation) p.translation = translation
+    } catch (err) {
+      p.error = err
+      diag($, `translate paragraph error len=${p.text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
+    }
   })
 
-  const out = []
   let any = false
-  for (const p of paras) {
-    out.push(p.code !== undefined ? p.code : p.text)
-    if (p.zh) {
-      out.push(p.zh.split('\n').map((l) => `> ${l}`).join('\n'))
+  let errors = 0
+  const md = paras.map((p) => {
+    if (p.code !== undefined) return p.code
+    if (p.separator !== undefined) return p.separator
+    if (p.error) errors++
+    if (p.translation) {
       any = true
+      return quoteTranslation(p.text, p.translation)
     }
-  }
-  return any ? out.join('\n\n') : null
+    return p.text
+  }).join('')
+  return { md: any ? md : null, errors }
 }
 
 /* ---------------- 出站：保证发给模型的一定是英文 ---------------- */
+
+const OUT_UNCHANGED_INSTRUCTION =
+  'If nothing needs changing, return the original text exactly unchanged. Never replace it with an assessment such as "No changes are needed". '
 
 const OUT_MODEL_SYSTEM = () =>
   'The message is a prompt on its way to a coding agent. Rewrite it into natural, grammatically correct English: ' +
@@ -304,7 +415,7 @@ const OUT_MODEL_SYSTEM = () =>
   'fix only grammar, spelling and typography errors. Never change the meaning, tone or technical content. ' +
   `The author's first language is ${langName()}; keep the English plain and idiomatic. ` +
   'Preserve the markdown structure; keep code, identifiers, file paths, commands, flags and URLs unchanged. ' +
-  'If nothing needs changing, return the text exactly as given. ' +
+  OUT_UNCHANGED_INSTRUCTION +
   'Return ONLY the rewritten text, no preamble, no notes.'
 
 const OUT_OPENAI_SYSTEM = () =>
@@ -312,7 +423,83 @@ const OUT_OPENAI_SYSTEM = () =>
   'language, or fix only grammar/spelling/typo errors if it is already English. Never change the meaning. ' +
   `The author's first language is ${langName()}. ` +
   'Keep code, identifiers, file paths, commands and URLs unchanged. Preserve the markdown structure. ' +
-  'If nothing needs changing, return the text exactly as given. Return ONLY the rewritten text.'
+  OUT_UNCHANGED_INSTRUCTION + 'Return ONLY the rewritten text.'
+
+/** 数非拉丁字母（任意文字系统），出站校验用 */
+function nonLatinLetterCount(s) {
+  const prose = s.replace(/(`+)[\s\S]*?\1|“[^”]*”|‘[^’]*’|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '')
+  return (prose.match(/(?!\p{Script=Latin})\p{L}/gu) ?? []).length
+}
+
+const asciiTokens = (s) => s.toLowerCase().match(/[a-z0-9]+(?:'[a-z0-9]+)?/g) || []
+
+const EN_FUNCTION_WORDS = new Set([
+  'the', 'this', 'that', 'these', 'those', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'to', 'of',
+  'and', 'with', 'for', 'it', 'you', 'your', 'my', 'please',
+])
+
+/** 保守英文判断：函数词至少两个，或常见编程祈使句/问候。避免把法/西等拉丁语言套英文重合约束。 */
+function isLikelyEnglish(s) {
+  const tokens = asciiTokens(s)
+  let hits = 0
+  for (const t of tokens) if (EN_FUNCTION_WORDS.has(t) && ++hits >= 2) return true
+  const t = s.trim().toLowerCase()
+  return /^(please\s+)?(fix|check|review|implement|add|remove|update|explain|translate|write|show|help|hello|hi)\b/.test(t)
+}
+
+function hasMetaPreamble(output) {
+  return /^(?:(?:sure[,!.]?\s+)?here(?:'s| is) (?:the |your )?(?:translation|rewritten|corrected|revised)(?: text| prompt)?\s*:|(?:the|your) (?:(?:provided|given|input|original) )?(?:text|prompt|message|sentence) (?:contains|is (?:already|grammatically|correct|natural))|no (?:changes|corrections|edits) (?:are |were )?(?:needed|required|necessary))/i.test(output.trim())
+}
+
+/**
+ * 出站改写结果校验：翻译服务可能不翻译、只做源语言润色，或返回元评论。
+ * 只有输出真的像「这段话的英文改写」才认：
+ *  - 任意非拉丁输入/混合输入 → 输出的非拉丁字母须降到一半以下，且包含 ASCII 英文字母；
+ *  - 可能是英文且不含非拉丁正文的输入 → 输出须与输入按完整 token 多重集至少重合一半，长度在合理范围；
+ *  - 其他拉丁源语言不套英文重合约束，允许法/西/德等正确翻译成英文时零重合。
+ */
+function okRewrite(input, output) {
+  const inp = input.trim()
+  const out = output.trim()
+  if (!out) return false
+  const foreign = nonLatinLetterCount(inp)
+  const resultForeign = nonLatinLetterCount(out)
+  if (foreign ? resultForeign >= Math.max(1, foreign / 2) : resultForeign > 0) return false
+  const code = inp.match(/(`+)[\s\S]*?\1/g) ?? []
+  if (code.some(span => !out.includes(span))) return false
+  if (inp === out) return true
+  if (!/[A-Za-z]/.test(out)) return false
+  if (hasMetaPreamble(out)) return false
+
+  // Translating foreign prose can add English words beyond the original ASCII prefix.
+  if (foreign || !isLikelyEnglish(inp)) return true
+  const ti = asciiTokens(inp)
+  if (ti.length === 0) return true
+  const to = asciiTokens(out)
+  const counts = new Map()
+  for (const t of ti) counts.set(t, (counts.get(t) || 0) + 1)
+  let hit = 0
+  for (const t of to) {
+    const n = counts.get(t) || 0
+    if (n > 0) {
+      hit++
+      counts.set(t, n - 1)
+    }
+  }
+  // 修语法是轻改：词重合要过半，词数也得在 0.6–1.5 倍之间（元评论动辄长出三倍）
+  return hit / ti.length >= 0.5 && to.length >= ti.length * 0.6 && to.length <= ti.length * 1.5
+}
+
+/** 校验失败重试：用明确系统提示分开「翻译成英文」和「只修英文语法」，不复用首轮混合提示。 */
+const OUT_TRANSLATE_RETRY_SYSTEM = () =>
+  'Translate the user message into English faithfully. Do not polish it in the source language. ' +
+  'Preserve markdown structure, code, identifiers, file paths, commands, flags and URLs unchanged. ' +
+  OUT_UNCHANGED_INSTRUCTION + 'Return ONLY the English translation, no preamble, no notes.'
+
+const OUT_GRAMMAR_RETRY_SYSTEM = () =>
+  'Fix only grammar, spelling and typography errors in this English prompt. Do not translate, explain, summarize or add notes. ' +
+  'Preserve markdown structure, code, identifiers, file paths, commands, flags and URLs unchanged. ' +
+  OUT_UNCHANGED_INSTRUCTION + 'Return ONLY the corrected text.'
 
 /**
  * 出站一段散文：转成英文；已是英文且无需改动时返回 null（保持原文）。
@@ -322,47 +509,73 @@ const OUT_OPENAI_SYSTEM = () =>
 async function ensureEnglishProse($, text) {
   if (looksTechnical(text)) return null // 粘贴的错误信息/JSON/日志等原样放行
   if (cfg.provider === 'microsoft') {
-    // 超长段按行边界切块逐块送翻；首块检测出英文即整段放行（免费接口没有语法检查能力）
-    const chunks = chunkParagraph(text)
+    // 超长段按行边界切块逐块送翻；检测出英文的块只保留该块（免费接口没有语法检查能力）
     const out = []
     let any = false
-    for (let i = 0; i < chunks.length; i++) {
-      const r = await msFetch($, chunks[i], 'en')
-      if (i === 0 && /^en(-|$)/i.test(r.from)) return null
+    for (const chunk of chunkParagraph(text)) {
+      const r = await msFetch($, chunk, 'en')
+      if (/^en(-|$)/i.test(r.from) && !nonLatinLetterCount(chunk)) {
+        out.push(chunk)
+        continue
+      }
       const en = r.out.trim()
-      if (en && en !== chunks[i].trim()) { out.push(en); any = true } else out.push(chunks[i])
+      if (!okRewrite(chunk, en)) throw new Error('microsoft did not return an English translation')
+      if (en !== chunk.trim()) { out.push(preserveWhitespace(chunk, en)); any = true } else out.push(chunk)
     }
-    return any ? out.join('\n') : null
+    return any ? out.join('') : null
   }
-  const system = cfg.provider === 'session' ? OUT_MODEL_SYSTEM() : OUT_OPENAI_SYSTEM()
+  const system = nonLatinLetterCount(text) || !isLikelyEnglish(text)
+    ? OUT_TRANSLATE_RETRY_SYSTEM()
+    : cfg.provider === 'session' ? OUT_MODEL_SYSTEM() : OUT_OPENAI_SYSTEM()
   const out = []
   let any = false
   for (const chunk of chunkParagraph(text)) {
-    const r = await fetchOne($, chunk, { system })
-    const en = r.out.trim()
-    if (en && en !== chunk.trim()) { out.push(en); any = true } else out.push(chunk)
+    const likelyEnglish = isLikelyEnglish(chunk)
+    let en = (await fetchOne($, chunk, { system })).out.trim()
+    // 不认的改写：输出还是源语言（只润色没翻译）、非拉丁原样返回、英文输入收到元评论。
+    // 用明确系统提示重试一次，仍不过就放行该段原文——绝不让废话冒充英文发出。
+    const invalid = (candidate) => !okRewrite(chunk, candidate)
+    if (invalid(en)) {
+      diag($, `outbound suspect in="${chunk.slice(0, 40)}" out="${en.slice(0, 40)}"`)
+      const retrySystem = likelyEnglish && nonLatinLetterCount(chunk) === 0 ? OUT_GRAMMAR_RETRY_SYSTEM() : OUT_TRANSLATE_RETRY_SYSTEM()
+      const retry = (await fetchOne($, chunk, { system: retrySystem })).out.trim()
+      if (retry && !invalid(retry)) {
+        en = retry
+        diag($, `outbound retry ok out="${retry.slice(0, 40)}"`)
+      } else {
+        diag($, `outbound retry failed; fallback original len=${chunk.length}`)
+        throw new Error('outbound retry did not return an English rewrite')
+      }
+    }
+    if (en && en !== chunk.trim()) { out.push(preserveWhitespace(chunk, en)); any = true } else out.push(chunk)
   }
-  return any ? out.join('\n') : null
+  return any ? out.join('') : null
 }
 
-/** 出站整块：``` 代码围栏不动，散文段并发处理；返回 { text, changed }（没改动时 text 即原文） */
+/** 出站整块：代码/分隔符不动，散文段并发处理；返回 { text, changed, errors }（没改动时 text 即原文） */
 async function outboundBlock($, text) {
   const paras = splitParas(text)
   await runPool(paras, 4, async (p) => {
-    if (p.code !== undefined) return
+    if (p.text === undefined) return
     try {
       const en = await ensureEnglishProse($, p.text)
-      if (en) p.en = en
-    } catch { /* 单段失败放原文，绝不拦提示词 */ }
+      if (en) p.en = preserveWhitespace(p.text, en)
+    } catch (err) {
+      p.error = err
+      diag($, `outbound paragraph error len=${p.text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
+    }
   })
 
   let any = false
+  let errors = 0
   const out = paras.map((p) => {
     if (p.code !== undefined) return p.code
+    if (p.separator !== undefined) return p.separator
+    if (p.error) errors++
     if (p.en) any = true
     return p.en ?? p.text
-  })
-  return { text: any ? out.join('\n\n') : text, changed: any }
+  }).join('')
+  return { text: any ? out : text, changed: any, errors }
 }
 
 /** 诊断：写 /tmp/pt-live.log（只记关键转移，保留最近 60 条） */
@@ -378,16 +591,19 @@ function scheduleOne($, text) {
   putCapped(cache, text, { state: 'pending' })
   diag($, `schedule len=${text.length}`)
   translateBlock($, text)
-    .then((md) => {
-      putCapped(cache, text, { state: md ? 'done' : 'skip', md })
-      diag($, `done len=${text.length} ${md ? 'md=' + md.length : 'skip'}`)
+    .then(({ md, errors }) => {
+      const state = md ? 'done' : errors ? 'error' : 'skip'
+      putCapped(cache, text, { state, md, errors })
+      diag($, `done len=${text.length} state=${state} errors=${errors}${md ? ' md=' + md.length : ''}`)
       if (show) {
         $.ui.invalidate('ui.render')
-        $.ui.toast('译文就绪')
+        if (state === 'done' && errors) $.ui.toast(`部分译文就绪（${errors} 段失败，见 /tmp/pt-live.log）`)
+        else if (state === 'done') $.ui.toast('译文就绪')
+        else if (state === 'error') $.ui.toast('翻译失败，见 /tmp/pt-live.log')
       }
     })
     .catch((err) => {
-      putCapped(cache, text, { state: 'error' })
+      putCapped(cache, text, { state: 'error', errors: 1 })
       diag($, `error len=${text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
       if (show) $.ui.toast('翻译失败，见 /tmp/pt-live.log')
     })
@@ -405,6 +621,12 @@ function onRenderText($, text) {
 }
 
 export function register(on, options) {
+  if (stableTimer) stableTimer.cancel()
+  stableTimer = null
+  seen.clear()
+  cache.clear()
+  outboundMap.clear()
+
   // userConfig（/config 面板或 settings.json 的 pluginConfigs["parrot-translate@inline"]）
   cfg.showByDefault = options?.show_by_default !== false // 默认 true（0.4.3 起）
   cfg.outbound = options?.outbound !== false
@@ -418,6 +640,7 @@ export function register(on, options) {
   show = cfg.showByDefault
 
   on('session.start', async ($, e, next) => {
+    outboundMap.clear()
     await $.command.register({ name: 'translate', description: 'Show/hide translation of replies' })
     diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault} outbound=${cfg.outbound} lang=${cfg.lang}`)
     return next(e)
@@ -429,7 +652,7 @@ export function register(on, options) {
     if (show) {
       // 等待反馈：还有段在翻时直接告诉用户，免得对着空白狂按
       const pending = [...cache.values()].filter((e) => e.state === 'pending').length
-      const error = [...cache.values()].filter((e) => e.state === 'error').length
+      const error = [...cache.values()].filter((e) => e.state === 'error' || e.errors).length
       if (pending) $.ui.toast(`翻译中（还有 ${pending} 块，本地模型较慢）…`)
       else if (error) $.ui.toast('部分翻译失败，详见 /tmp/pt-live.log')
       else $.ui.toast('译文：显示')
@@ -465,10 +688,14 @@ export function register(on, options) {
     if (!cfg.outbound || !text.trim() || text.startsWith('/')) return next(e)
     try {
       if (cfg.provider !== 'microsoft' && text.length > 120) $.ui.toast('正在把提示词转成英文…')
-      const { text: en, changed } = await outboundBlock($, text)
-      if (!changed || !en.trim()) return next(e)
-      putCapped(outboundMap, en, text) // 先入映射再 next，跟上的重渲染直接能画对照
-      diag($, `outbound len=${text.length} -> ${en.length}`)
+      const { text: en, changed, errors } = await outboundBlock($, text)
+      if (!changed || !en.trim()) {
+        if (errors) $.ui.toast('提示词英文转换失败，已原样发送（见 /tmp/pt-live.log）')
+        return next(e)
+      }
+      if (errors) $.ui.toast(`提示词已部分转成英文（${errors} 段保留原文，见 /tmp/pt-live.log）`)
+      putOutboundMap(en, text) // 先入映射再 next，跟上的重渲染直接能画对照；冲突时标 ambiguous
+      diag($, `outbound len=${text.length} -> ${en.length} errors=${errors}`)
       // 模型与落盘都是英文；屏幕上的用户行跟着变英文，由下面的渲染钩子画成双语对照
       return next({ ...e, text: en })
     } catch (err) {
@@ -481,7 +708,7 @@ export function register(on, options) {
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     const text = e.props?.text
     const orig = text ? outboundMap.get(text) : undefined
-    if (orig === undefined) return next(e)
+    if (orig === undefined || orig === null) return next(e)
     const quote = text.split('\n').map((l) => `> ${l}`).join('\n')
     return next({ ...e, props: { ...e.props, text: `${orig}\n\n${quote}` } })
   })

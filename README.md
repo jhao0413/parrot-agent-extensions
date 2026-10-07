@@ -7,7 +7,7 @@
 ## 组成
 
 - [claude/parrot-translate](./claude/parrot-translate)：Claude Code 插件。提交时将 prompt 改写为地道英文，用户消息行双语对照；回复在后台译成 `lang` 配置的语言，`Ctrl+Y` 切换显示
-- [pi/](./pi)：计划中的 pi 实现，详见其 README
+- [pi/](./pi)：pi 扩展（`parrot-translate.ts`）。提交时改写为英文，回复、工具调用前的说明和思考块完成后后台翻译；markdown transformer 只改显示，`Ctrl+Y` / `/translate` 切换译文
 
 安装、配置与实现细节见各插件的 README。
 
