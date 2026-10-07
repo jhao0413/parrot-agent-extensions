@@ -501,12 +501,36 @@ const OUT_GRAMMAR_RETRY_SYSTEM = () =>
   'Preserve markdown structure, code, identifiers, file paths, commands, flags and URLs unchanged. ' +
   OUT_UNCHANGED_INSTRUCTION + 'Return ONLY the corrected text.'
 
-/**
- * 出站一段散文：转成英文；已是英文且无需改动时返回 null（保持原文）。
- * microsoft 靠接口自带的源语言检测；session/openai 一条提示词同时覆盖
- * 「其他语言→翻译」和「英文→修语法」，由模型自己判断走哪条。
- */
+/** Hide file mentions from providers, including quoted paths containing spaces. */
+function protectFileReferences(text) {
+  let prefix = 'PARROT_FILE_REF_'
+  while (text.includes(prefix)) prefix = '_' + prefix
+  const refs = []
+  const masked = text.replace(/(?<![\p{L}\p{N}_@])@(?:"(?:\\.|[^"\r\n])*"|'(?:\\.|[^'\r\n])*'|[^\s`"'<>()[\]{},;!?，。；！？、]+)/gu, (match) => {
+    // Sentence punctuation is not part of an unquoted path.
+    const ref = /^@["']/.test(match) ? match : match.replace(/[.:]+$/, '')
+    if (ref.length < 2) return match
+    const token = '`' + prefix + refs.length + '`'
+    refs.push({ token, ref })
+    return token + match.slice(ref.length)
+  })
+  return { masked, restore(output) {
+    const tokens = output.match(new RegExp('`' + prefix + '\\d+`', 'g')) ?? []
+    if (tokens.length !== refs.length || tokens.some((token, i) => token !== refs[i].token)) {
+      throw new Error('outbound rewrite changed file references')
+    }
+    return output.replace(new RegExp('`' + prefix + '\\d+`', 'g'), token => refs.find(ref => ref.token === token).ref)
+  } }
+}
+
+/** Rewrite outbound prose while restoring file mentions exactly. */
 async function ensureEnglishProse($, text) {
+  const protectedText = protectFileReferences(text)
+  const result = await rewriteEnglishProse($, protectedText.masked)
+  return result === null ? null : protectedText.restore(result)
+}
+
+async function rewriteEnglishProse($, text) {
   if (looksTechnical(text)) return null // 粘贴的错误信息/JSON/日志等原样放行
   if (cfg.provider === 'microsoft') {
     // 超长段按行边界切块逐块送翻；检测出英文的块只保留该块（免费接口没有语法检查能力）

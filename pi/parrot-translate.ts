@@ -566,12 +566,40 @@ const OUT_RETRY_WRAP = (chunk: string) =>
 const OUT_GRAMMAR_WRAP = (chunk: string) =>
 	"Fix only grammar, spelling and typography in the following English text. Return ONLY the corrected text.\n\n" + chunk
 
-/**
- * 出站一段散文：转成英文；已是英文且无需改动时返回 null（保持原文）。
- * microsoft 靠接口自带的源语言检测；session/openai 一条提示词同时覆盖
- * 「其他语言→翻译」和「英文→修语法」，由模型自己判断走哪条。
- */
+/** Hide file mentions from providers, including quoted paths containing spaces. */
+function protectFileReferences(text: string) {
+	let prefix = 'PARROT_FILE_REF_'
+	while (text.includes(prefix)) prefix = '_' + prefix
+	const refs: { token: string; ref: string; before: string; after: string }[] = []
+	const quoteAt = (source: string, index: number) => /[`"'“”‘’]/.test(source[index] ?? "") ? source[index] : ""
+	// Pi leaves ASCII punctuation in unquoted completions (e.g. src/[id].tsx).
+	// Preserve the whole token; CJK punctuation and whitespace delimit prose.
+	const masked = text.replace(/(?<![\p{Script=Latin}\p{N}_@])@(?:"(?:\\.|[^"\r\n])*"|'(?:\\.|[^'\r\n])*'|[^\s`"'，。．：；！？、（）［］｛｝“”‘’…—]+)/gu, (ref, offset: number) => {
+		const token = '`' + prefix + refs.length + '`'
+		refs.push({ token, ref, before: quoteAt(text, offset - 1), after: quoteAt(text, offset + ref.length) })
+		return token
+	})
+	return { masked, restore(output: string) {
+		const tokens = [...output.matchAll(new RegExp('`' + prefix + '\\d+`', 'g'))]
+		if (tokens.length !== refs.length || output.split(prefix).length - 1 !== refs.length ||
+			tokens.some((match, i) => match[0] !== refs[i].token ||
+				quoteAt(output, match.index - 1) !== refs[i].before ||
+				quoteAt(output, match.index + match[0].length) !== refs[i].after)) {
+			throw new Error('outbound rewrite changed file references')
+		}
+		let index = 0
+		return output.replace(new RegExp('`' + prefix + '\\d+`', 'g'), () => refs[index++].ref)
+	} }
+}
+
+/** Rewrite outbound prose while restoring file mentions exactly. */
 async function ensureEnglishProse(ctx: ExtensionContext, text: string) {
+	const protectedText = protectFileReferences(text)
+	const result = await rewriteEnglishProse(ctx, protectedText.masked)
+	return result === null ? null : protectedText.restore(result)
+}
+
+async function rewriteEnglishProse(ctx: ExtensionContext, text: string) {
 	if (looksTechnical(text)) return null // 粘贴的错误信息/JSON/日志等原样放行
 	const epoch = generation
 	const checkBranch = () => {

@@ -95,6 +95,48 @@ async function submit(runtime, h, text) {
 }
 
 for (const runtime of ['pi', 'claude']) {
+  test(`${runtime}: outbound file references never reach translation providers`, async () => {
+    const refs = ['@src/登录.ts', '@"docs/使用 指南.md"', "@'docs/another file.md'", '@src/app.ts:12', '@src/登录.ts']
+    for (const provider of ['openai', 'session', 'microsoft']) {
+      const source = `请检查 ${refs.join(' 和 ')}。`
+      const h = load(runtime, { config: { provider }, answer: text => {
+        for (const ref of refs) assert.ok(!text.includes(ref), `provider saw ${ref}`)
+        return { from: 'zh-Hans', out: text.replace('请检查', 'Please review').replaceAll(' 和 ', ' and ') }
+      } })
+      assert.equal(await submit(runtime, h, source), `Please review ${refs.join(' and ')}。`)
+      assert.equal(h.calls.length, 1)
+    }
+  })
+
+  test(`${runtime}: missing, changed, duplicated or reordered reference placeholders fall back safely`, async () => {
+    const source = '请检查 @src/登录.ts 和 @src/app.ts'
+    for (const corrupt of [
+      text => text.replace(/`PARROT_FILE_REF_0`/, ''),
+      text => text.replace('PARROT_FILE_REF_0', 'PARROT_FILE_REF_99'),
+      text => text + ' `PARROT_FILE_REF_0`',
+      text => text.replace('PARROT_FILE_REF_0', 'TEMP').replace('PARROT_FILE_REF_1', 'PARROT_FILE_REF_0').replace('TEMP', 'PARROT_FILE_REF_1'),
+    ]) {
+      const h = load(runtime, { answer: text => corrupt(text.replace('请检查', 'Please review').replace(' 和 ', ' and ')) })
+      assert.equal(await submit(runtime, h, source), source)
+    }
+  })
+
+  test(`${runtime}: reference masking avoids collisions and preserves punctuation and email text`, async () => {
+    const source = '请检查 @src/app.ts. (contact user@example.com) PARROT_FILE_REF_0'
+    const h = load(runtime, { answer: text => text.replace('请检查', 'Please review') })
+    assert.equal(await submit(runtime, h, source), source.replace('请检查', 'Please review'))
+    assert.ok(h.calls[0].text.includes('user@example.com'))
+    assert.ok(h.calls[0].text.includes(runtime === 'pi' ? '`_PARROT_FILE_REF_0`' : '`_PARROT_FILE_REF_0`.'))
+  })
+
+  test(`${runtime}: references stay intact across long prompt chunks`, async () => {
+    const source = '请检查 '.repeat(750) + '@src/登录.ts'
+    const h = load(runtime, { answer: text => text.replaceAll('请检查', 'Please review') })
+    assert.equal(await submit(runtime, h, source), source.replaceAll('请检查', 'Please review'))
+    assert.ok(h.calls.length > 1)
+    assert.ok(h.calls.every(call => call.text.length <= 3000 && !call.text.includes('@src/登录.ts')))
+  })
+
   test(`${runtime}: accepts foreign translations and real English corrections`, () => {
     const h = load(runtime)
     const cases = [
@@ -335,6 +377,56 @@ for (const runtime of ['pi', 'claude']) {
     assert.ok(h.calls.every(call => call.text.length <= 3000))
   })
 }
+
+test('Pi: a placeholder split at the request limit cannot escape into the submitted prompt', async () => {
+  const source = '请'.repeat(2995) + '@src/登录.ts'
+  const h = load('pi', { answer: text => text.replaceAll('请', 'Review ').replace('`PARR', 'BROKEN') })
+  assert.ok(await submit('pi', h, source) === source, 'a damaged split marker must fall back to the original')
+  assert.ok(h.calls.length > 1)
+  assert.ok(h.calls.every(call => !call.text.includes('@src/登录.ts')))
+  assert.ok(h.notices.some(message => /保留原文/.test(message)))
+})
+
+test('Pi: retries preserve masked references and restore them after a valid rewrite', async () => {
+  const source = '请检查 @src/登录.ts'
+  const h = load('pi', { answer: (text, n) => n === 1
+    ? 'The prompt is already correct.'
+    : text.slice(text.lastIndexOf('\n\n') + 2).replace('请检查', 'Please review') })
+  assert.equal(await submit('pi', h, source), 'Please review @src/登录.ts')
+  assert.equal(h.calls.length, 2)
+  assert.ok(h.calls.every(call => !call.text.includes('@src/登录.ts')))
+})
+
+test('Pi: reference placeholders cannot acquire quotes or leak extra markers', async () => {
+  const source = '请检查 @src/登录.ts'
+  for (const corrupt of [
+    text => text.replace('`PARROT_FILE_REF_0`', '"`PARROT_FILE_REF_0`"'),
+    text => text.replace('`PARROT_FILE_REF_0`', '``PARROT_FILE_REF_0``'),
+    text => text + ' PARROT_FILE_REF_99',
+  ]) {
+    const h = load('pi', { answer: text => corrupt(text.replace('请检查', 'Please review')) })
+    assert.equal(await submit('pi', h, source), source)
+  }
+})
+
+test('Pi: existing quote and code wrappers around mentions remain intact', async () => {
+  for (const ref of ['`@src/登录.ts`', '"@src/app.ts"', '@"docs/使用 指南.md"']) {
+    const source = `请检查 ${ref}`
+    const h = load('pi', { answer: text => text.replace('请检查', 'Please review') })
+    assert.equal(await submit('pi', h, source), `Please review ${ref}`)
+  }
+})
+
+test('Pi: file references adjoining Chinese prose and paths with punctuation are protected', async () => {
+  for (const source of ['请检查@src/登录.ts', '请检查 @src/组件(旧版).tsx', '请检查 @src/a,b.ts', '请检查 @src/[id].ts']) {
+    const h = load('pi', { answer: text => {
+      assert.ok(!text.includes('@src/'), 'the complete mention must be hidden')
+      assert.ok(!/登录|组件|旧版|\[id\]|a,b/.test(text), 'path suffixes must also be hidden')
+      return text.replace('请检查', 'Please review')
+    } })
+    assert.equal(await submit('pi', h, source), source.replace('请检查', 'Please review'))
+  }
+})
 
 test('Pi: intermediate text and thinking render before final message_end', async () => {
   const h = load('pi')
